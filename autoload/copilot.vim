@@ -197,28 +197,33 @@ function! s:SuggestionTextWithAdjustments() abort
       return empty
     endif
     let choice = get(b:_copilot.suggestions, b:_copilot.choice, {})
-    if !has_key(choice, 'range') || choice.range.start.line != line('.') - 1 || type(choice.insertText) !=# v:t_string
+    if !has_key(choice, 'range') || choice.range.start.line > line('.') - 1 || type(choice.insertText) !=# v:t_string
       return empty
     endif
     let line = getline('.')
     let offset = col('.') - 1
-    let byte_offset = copilot#util#UTF16ToByteIdx(line, choice.range.start.character)
-    let choice_text = strpart(line, 0, byte_offset) .
+    let lines = getline(choice.range.start.line + 1, line('.'))
+    let byte_offset = copilot#util#UTF16ToByteIdx(lines[0], choice.range.start.character)
+    let choice_text = strpart(lines[0], 0, byte_offset) .
           \ substitute(substitute(choice.insertText, '\r\n\=', '\n', 'g'), '\n*$', '', '')
-    let typed = strpart(line, 0, offset)
+    let lines[-1] = strpart(line, 0, offset)
+    let typed = join(lines, "\n")
     let end_offset = copilot#util#UTF16ToByteIdx(line, choice.range.end.character)
     if end_offset < 0
       let end_offset = len(line)
     endif
-    let delete = strpart(line, offset, end_offset - offset)
+    let delete = get(b:_copilot, 'deleteChars', strpart(line, offset, end_offset - offset))
+    if strpart(line, offset, len(delete)) !=# delete
+      return empty
+    endif
     if typed =~# '^\s*$'
       let leading = strpart(matchstr(choice_text, '^\s\+'), 0, len(typed))
       let unindented = strpart(choice_text, len(leading))
       if strpart(typed, 0, len(leading)) ==# leading && unindented !=# delete
         return [unindented, len(typed) - len(leading), delete, choice]
       endif
-    elseif typed ==# strpart(choice_text, 0, offset)
-      return [strpart(choice_text, offset), 0, delete, choice]
+    elseif typed ==# strpart(choice_text, 0, len(typed))
+      return [strpart(choice_text, len(typed)), 0, delete, choice]
     endif
   catch
     call copilot#logger#Exception()
@@ -228,7 +233,7 @@ endfunction
 
 
 function! s:Advance(count, context, ...) abort
-  if a:context isnot# get(b:, '_copilot', {})
+  if a:context isnot# get(b:, '_copilot', {}) || exists('b:_copilot.deleteChars')
     return
   endif
   let a:context.choice += a:count
@@ -257,7 +262,9 @@ function! s:GetSuggestionsCyclingCallback(context, result) abort
 endfunction
 
 function! s:GetSuggestionsCycling(callback) abort
-  if exists('b:_copilot.cycling_callbacks')
+  if exists('b:_copilot.deleteChars')
+    return copilot#Suggest()
+  elseif exists('b:_copilot.cycling_callbacks')
     call add(b:_copilot.cycling_callbacks, a:callback)
   elseif exists('b:_copilot.cycling')
     call a:callback(b:_copilot)
@@ -415,8 +422,11 @@ function! copilot#Schedule() abort
     return
   endif
   call s:UpdatePreview()
-  let delay = get(g:, 'copilot_idle_delay', 45)
   call timer_stop(get(g:, '_copilot_timer', -1))
+  if exists('b:_copilot.deleteChars') && !empty(copilot#GetDisplayedSuggestion().text)
+    return
+  endif
+  let delay = get(g:, 'copilot_idle_delay', 45)
   let g:_copilot_timer = timer_start(delay, function('s:Trigger', [bufnr('')]))
 endfunction
 
@@ -483,7 +493,6 @@ endfunction
 function! copilot#Accept(...) abort
   let s = copilot#GetDisplayedSuggestion()
   if !empty(s.text)
-    unlet! b:_copilot
     let text = ''
     if a:0 > 1
       let text = substitute(matchstr(s.text, "\n*" . '\%(' . a:2 .'\)'), "\n*$", '', '')
@@ -501,12 +510,18 @@ function! copilot#Accept(...) abort
     if text ==# s.text && has_key(s.item, 'command')
       call copilot#Request('workspace/executeCommand', s.item.command)
     else
-      let line_text = strpart(getline('.'), 0, col('.') - 1) . text
+      let line_text = join(getline(s.item.range.start.line + 1, line('.') - 1) +
+            \ [strpart(getline('.'), 0, col('.') - 1) . text], "\n")
       call copilot#Notify('textDocument/didPartiallyAcceptCompletion', {
             \ 'item': s.item,
             \ 'acceptedLength': copilot#util#UTF16Width(line_text) - s.item.range.start.character})
     endif
-    call s:ClearPreview()
+    if empty(leftover)
+      unlet! b:_copilot
+      call s:ClearPreview()
+    else
+      let b:_copilot.deleteChars = strpart(s.deleteChars, len(delete_chars))
+    endif
     let s:suggestion_text = text
     let recall = text =~# "\n" ? "\<C-R>\<C-O>=" : "\<C-R>\<C-R>="
     return repeat("\<Left>\<Del>", s.outdentSize) . repeat("\<Del>", strchars(delete_chars)) .
