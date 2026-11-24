@@ -158,6 +158,11 @@ function! copilot#Complete(...) abort
   endif
   let target = [bufnr(''), getbufvar('', 'changedtick'), line('.'), col('.')]
   if !exists('b:_copilot.target') || b:_copilot.target !=# target
+    let preview = {}
+    if exists('b:_copilot.deleteChars') && !empty(copilot#GetDisplayedSuggestion().text)
+      let preview = {'suggestions': b:_copilot.suggestions, 'choice': b:_copilot.choice,
+            \ 'deleteChars': b:_copilot.deleteChars}
+    endif
     if exists('b:_copilot.first')
       call copilot#client#Cancel(b:_copilot.first)
     endif
@@ -169,10 +174,10 @@ function! copilot#Complete(...) abort
           \ 'position': copilot#util#AppendPosition(),
           \ 'formattingOptions': {'insertSpaces': &expandtab ? v:true : v:false, 'tabSize': shiftwidth()},
           \ 'context': {'triggerKind': s:inline_automatic}}
-    let b:_copilot = {
+    let b:_copilot = extend({
           \ 'target': target,
           \ 'params': params,
-          \ 'first': copilot#Request('textDocument/inlineCompletion', params)}
+          \ 'first': copilot#Request('textDocument/inlineCompletion', params)}, preview)
     let g:_copilot_last = b:_copilot
   endif
   let completion = b:_copilot.first
@@ -379,16 +384,22 @@ function! s:UpdatePreview() abort
 endfunction
 
 function! s:HandleTriggerResult(state, result) abort
-  let a:state.suggestions = type(a:result) == type([]) ? a:result : get(empty(a:result) ? {} : a:result, 'items', [])
-  let a:state.choice = 0
+  let suggestions = type(a:result) == type([]) ? a:result : get(empty(a:result) ? {} : a:result, 'items', [])
+  if !empty(suggestions) || !has_key(a:state, 'deleteChars')
+    let a:state.suggestions = suggestions
+    let a:state.choice = 0
+    unlet! a:state.deleteChars
+  endif
   if get(b:, '_copilot') is# a:state
     call s:UpdatePreview()
   endif
 endfunction
 
 function! s:HandleTriggerError(state, result) abort
-  let a:state.suggestions = []
-  let a:state.choice = 0
+  if !has_key(a:state, 'deleteChars')
+    let a:state.suggestions = []
+    let a:state.choice = 0
+  endif
   let a:state.error = a:result
   if get(b:, '_copilot') is# a:state
     call s:UpdatePreview()
@@ -423,9 +434,6 @@ function! copilot#Schedule() abort
   endif
   call s:UpdatePreview()
   call timer_stop(get(g:, '_copilot_timer', -1))
-  if exists('b:_copilot.deleteChars') && !empty(copilot#GetDisplayedSuggestion().text)
-    return
-  endif
   let delay = get(g:, 'copilot_idle_delay', 45)
   let g:_copilot_timer = timer_start(delay, function('s:Trigger', [bufnr('')]))
 endfunction

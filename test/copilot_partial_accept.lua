@@ -8,12 +8,15 @@ function! CopilotTestNotify(method, params) dict abort
 endfunction
 function! CopilotTestRequest(method, params, ...) dict abort
   let g:test_requests += 1
-  return {'params': a:params, 'resolve': [], 'reject': []}
+  let request = {'method': a:method, 'params': a:params, 'resolve': [], 'reject': []}
+  call add(g:test_pending, request)
+  return request
 endfunction
 function! copilot#client#New() abort
   return {'client_id': 1, 'Notify': function('CopilotTestNotify'), 'Request': function('CopilotTestRequest')}
 endfunction
 function! copilot#client#Cancel(request) abort
+  let a:request.cancelled = v:true
 endfunction
 function! copilot#client#Result(request, callback) abort
   call add(a:request.resolve, a:callback)
@@ -21,11 +24,17 @@ endfunction
 function! copilot#client#Error(request, callback) abort
   call add(a:request.reject, a:callback)
 endfunction
+function! CopilotTestReply(index, result, ...) abort
+  for Callback in g:test_pending[a:index - 1][a:0 ? 'reject' : 'resolve']
+    call Callback(a:result)
+  endfor
+endfunction
 ]], '\n', { plain = true }), temporary .. '/autoload/copilot/client.vim')
 vim.opt.runtimepath:prepend(root)
 vim.opt.runtimepath:prepend(temporary)
 vim.cmd('source ' .. vim.fn.fnameescape(root .. '/autoload/copilot.vim'))
 vim.g.test_requests = 0
+vim.g.test_pending = {}
 vim.g.test_notifications = {}
 vim.fn['copilot#Client']()
 vim.g.copilot_idle_delay = 60000
@@ -78,7 +87,7 @@ local function refresh(expected)
     vim.g.copilot_idle_delay = 5
     vim.fn['copilot#Schedule']()
     eq(vim.wait(expected and 1000 or 30, function() return vim.g.test_requests > before end, 5),
-      expected, 'fresh request only after an incompatible edit')
+      expected, 'completion refresh is requested')
     vim.g.copilot_idle_delay = 60000
   end
 end
@@ -96,6 +105,8 @@ local function run(name, line, column, text, actions)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { line })
   vim.api.nvim_win_set_cursor(0, { 1, column })
   vim.g.test_notifications = {}
+  vim.g.test_requests = 0
+  vim.g.test_pending = {}
   item = { insertText = text, range = {
     start = { line = 0, character = 0 },
     ['end'] = { line = 0, character = vim.str_utfindex(line, 'utf-16') },
@@ -116,11 +127,14 @@ local function run(name, line, column, text, actions)
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys .. '<Esc>', true, false, true), 'xt', false)
   stop_timer()
   assert(not failure, name .. ': ' .. tostring(failure))
+  for _, request in ipairs(vim.g.test_pending) do
+    eq(request.method, 'textDocument/inlineCompletion', 'no error telemetry was emitted')
+  end
   print('PASS ' .. name)
 end
 
 run('repeat word acceptance without waiting for a refresh', '', 0, 'alpha beta gamma', {
-  '<M-f>', check(' beta gamma'), refresh(false), check(' beta gamma'),
+  '<M-f>', check(' beta gamma'), refresh(true), check(' beta gamma'),
   '<M-f>', check(' gamma', nil, { 5, 10 }),
   '<M-a>', check('', { 'alpha beta gamma' }),
 })
@@ -160,6 +174,39 @@ run('pending cycling callbacks preserve the remaining suggestion', '', 0, 'alpha
   end,
   '<M-f>', function() vim.cmd('call ' .. advance .. '(1, g:pending_copilot)') end,
   check(' beta gamma'),
+})
+
+local function reply(index, text)
+  return function()
+    local position = vim.g.test_pending[index].params.position
+    vim.fn.CopilotTestReply(index, { items = text and {
+      { insertText = text, range = { start = position, ['end'] = position } },
+    } or {} })
+  end
+end
+run('new suggestions replace the retained preview', '', 0, 'alpha beta', {
+  '<M-f>', refresh(true), check(' beta'), reply(1, ' bravo'), check(' bravo'),
+  function() eq(vim.b._copilot.deleteChars, nil, 'new suggestions use their own replacement range') end,
+  '<M-a>', check('', { 'alpha bravo' }),
+})
+run('empty refreshes preserve the retained preview', '', 0, 'alpha beta', {
+  '<M-f>', refresh(true), reply(1), check(' beta'), '<M-a>', check('', { 'alpha beta' }),
+})
+run('failed refreshes preserve the retained preview', '', 0, 'alpha beta', {
+  '<M-f>', refresh(true),
+  function() vim.fn.CopilotTestReply(1, { message = 'unavailable' }, true) end,
+  check(' beta'), '<M-a>', check('', { 'alpha beta' }),
+})
+run('typing invalidates retained previews and stale replies', '', 0, 'alpha beta', {
+  '<M-f>', refresh(true), 'X', check(''), refresh(true),
+  function() eq(vim.g.test_pending[1].cancelled, true, 'the superseded request is cancelled') end,
+  reply(1, ' stale'), check(''), reply(2, ' fresh'), check(' fresh'),
+  '<M-a>', check('', { 'alphaX fresh' }),
+})
+run('partial acceptance during a refresh cancels stale replies', '', 0, 'alpha beta gamma', {
+  '<M-f>', refresh(true), '<M-f>', check(' gamma'), refresh(true),
+  reply(1, ' stale'), check(' gamma'), reply(2, ' delta'), check(' delta'),
+  '<M-a>', check('', { 'alpha beta delta' }),
 })
 vim.fn.delete(temporary, 'rf')
 vim.cmd('qa!')
