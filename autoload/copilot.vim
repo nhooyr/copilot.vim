@@ -396,14 +396,8 @@ function! s:HandleTriggerResult(state, result) abort
 endfunction
 
 function! s:HandleTriggerError(state, result) abort
-  if !has_key(a:state, 'deleteChars')
-    let a:state.suggestions = []
-    let a:state.choice = 0
-  endif
   let a:state.error = a:result
-  if get(b:, '_copilot') is# a:state
-    call s:UpdatePreview()
-  endif
+  call s:HandleTriggerResult(a:state, [])
 endfunction
 
 function! copilot#Suggest() abort
